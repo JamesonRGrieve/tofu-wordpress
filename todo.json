@@ -1,0 +1,49 @@
+{
+  "version": 1,
+  "domain": "providers.wordpress",
+  "title": "tofu-wordpress provider",
+  "description": "Native OpenTofu/Terraform provider for WordPress installed state (WP-CLI core/plugin/theme), wp-config.php, system cron, and safe content-directory relocation over SSH + WP-CLI. Buildable baseline complete: compiles, unit tests pass (relocation plan builder + wp-config renderer fully covered), gofmt/vet clean, schemas + DESIGN.md done, device-apply logic present but only unit-tested via injected exec.",
+  "hierarchy": { "parent": null, "children": [] },
+  "phases": [
+    {
+      "number": 1,
+      "title": "Baseline provider (DONE)",
+      "exit_criteria": "go build/vet/test/gofmt green; six resources register; imports to 0-diff by design; secrets write-only; relocation staged + rollback-armed.",
+      "items": [
+        { "number": "1.1", "feature": "SSH + WP-CLI transport", "description": "os/exec SSH client (key/cert only) + WPCLI wrapper over an injected Executor.", "sot": "code", "done": true },
+        { "number": "1.2", "feature": "wordpress_core / _config / _plugin / _theme / _cron", "description": "Typed resources, manage-declared-only diff, import-to-0-diff, write-only secrets.", "sot": "code", "done": true },
+        { "number": "1.3", "feature": "wordpress_content_dir safe relocation", "description": "Pure staged plan builder + rollback-armed executor, unit-tested via injected exec.", "sot": "code", "done": true }
+      ]
+    },
+    {
+      "number": 2,
+      "title": "Fleet / hardening parity with install_wordpress.yml",
+      "exit_criteria": "Every WordPress-side define and cron behavior in the Ansible baremetal playbook is expressible through this provider; node-OS hardening delegated to the host provider with a documented boundary.",
+      "items": [
+        { "number": "2.1", "feature": "wp-config hardening define parity", "description": "Confirm the full production define set (DISALLOW_FILE_EDIT, WP_AUTO_UPDATE_CORE, WP_POST_REVISIONS, EMPTY_TRASH_DAYS, FORCE_SSL_ADMIN, WP_REDIS_*) round-trips 0-diff through wordpress_config; add any missing raw/string classifications.", "sot": "NB", "done": false },
+        { "number": "2.2", "feature": "cron form reconciliation", "description": "Production cron runs `wp cron event run --due-now` as the web user; provider renders a wp-cron.php-via-PHP cron.d entry. Decide the canonical form (add a mode attr or align on wp-cron.php) so import from the Ansible-managed fleet is 0-diff.", "sot": "NB", "done": false },
+        { "number": "2.3", "feature": "FPM/OPcache tier + prod_hardening boundary", "description": "Document that PHP-FPM traffic tiers (low/medium/high) and wordpress_prod_hardening (fail2ban, mod_remoteip/Cloudflare, unattended-upgrades, AIDE, rkhunter, Apache/PHP drop-ins) are node-OS concerns owned by proxmox_host_config / a future host resource — not this provider. Keep the boundary in DESIGN.md.", "sot": "code", "done": false }
+      ]
+    },
+    {
+      "number": 3,
+      "title": "Lab-twin relocation drill (verification owed)",
+      "exit_criteria": "The content_dir relocation is proven end-to-end on a lab WordPress twin through dev-netbox → dev-semaphore, at 0-diff on re-apply, with the health gate and rollback exercised (including an induced failure).",
+      "items": [
+        { "number": "3.1", "feature": "Lab twin build", "description": "Stand up a lab WordPress install (CT) reachable by the runner over SSH with key/cert auth; snapshot before the drill.", "sot": "NB", "done": false },
+        { "number": "3.2", "feature": "Happy-path relocation", "description": "Relocate wp-content to a new path via Semaphore; verify HTTP 200, keep_symlink, retained original, and a zero-diff re-plan.", "sot": "NB", "done": false },
+        { "number": "3.3", "feature": "Induced-failure rollback", "description": "Force a health-check failure on the twin and confirm ExecuteRelocation restores WP_CONTENT_DIR and the original directory and releases maintenance mode.", "sot": "NB", "done": false }
+      ]
+    },
+    {
+      "number": 4,
+      "title": "Consumer-layer wiring in tofu/",
+      "exit_criteria": "A tofu/ module maps NetBox WordPressSite / WordPressContentDirectory + netbox-database credential_ref → these resources, driven by prod-semaphore.",
+      "items": [
+        { "number": "4.1", "feature": "netbox-wordpress SoT read", "description": "Consumer module reads WordPressSite (docroot, url, core version, plugin/theme set, cron cadence) and WordPressContentDirectory (content_dir/target/uploads/url) from NetBox.", "sot": "NB", "done": false },
+        { "number": "4.2", "feature": "OpenBao credential wiring", "description": "Resolve DatabaseUser.credential_ref → OpenBao and inject DB_PASSWORD + salts as write-only ephemeral values; provider SSH key from the OpenBao SSH-CA.", "sot": "NB", "done": false }
+      ]
+    }
+  ],
+  "state": {}
+}

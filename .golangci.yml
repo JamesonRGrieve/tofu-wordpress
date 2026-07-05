@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# golangci-lint config (go.md §4). Correctness/quality set beyond the defaults;
+# findings ratchet to zero and never regress.
+version: "2"
+
+linters:
+  enable:
+    - errcheck
+    - govet
+    - staticcheck
+    - unused
+    - ineffassign
+    - gocritic
+    - revive
+    - errorlint
+    - bodyclose
+    - contextcheck
+    - noctx
+    - nilerr
+    - wrapcheck
+    - unconvert
+    - unparam
+    - misspell
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
