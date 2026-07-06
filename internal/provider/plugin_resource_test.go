@@ -4,11 +4,98 @@ package provider
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
+	"github.com/JamesonRGrieve/tofu-wordpress/internal/wordpress"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
+	"github.com/hashicorp/terraform-plugin-framework/types"
 )
+
+// funcExec is a hermetic wordpress.Executor for provider-layer tests: it records
+// every command and delegates to an optional per-command func. No device.
+type funcExec struct {
+	calls []string
+	run   func(cmd string) (string, error)
+}
+
+func (f *funcExec) Run(cmd string, _ []byte) ([]byte, error) {
+	f.calls = append(f.calls, cmd)
+	if f.run != nil {
+		out, err := f.run(cmd)
+		return []byte(out), err
+	}
+	return nil, nil
+}
+
+func (f *funcExec) joined() string { return strings.Join(f.calls, "\n") }
+
+func TestComponentConverge(t *testing.T) {
+	wp := func(f *funcExec) *wordpress.WPCLI { return wordpress.NewWPCLI(f, "/var/www/html") }
+	model := func(state string) *componentModel {
+		return &componentModel{
+			Slug:   types.StringValue("woocommerce"),
+			State:  types.StringValue(state),
+			Source: types.StringValue("wporg"),
+		}
+	}
+
+	t.Run("active plugin installs and activates", func(t *testing.T) {
+		f := &funcExec{}
+		if err := (&componentResource{kind: "plugin"}).converge(wp(f), model(stateActive)); err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(f.joined(), "install") || !strings.Contains(f.joined(), "activate") {
+			t.Fatalf("active should install+activate; calls:\n%s", f.joined())
+		}
+	})
+
+	t.Run("present_inactive plugin deactivates", func(t *testing.T) {
+		f := &funcExec{}
+		if err := (&componentResource{kind: "plugin"}).converge(wp(f), model(statePresentInactive)); err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(f.joined(), "deactivate") {
+			t.Fatalf("present_inactive plugin should deactivate; calls:\n%s", f.joined())
+		}
+	})
+
+	t.Run("present_inactive theme does not deactivate", func(t *testing.T) {
+		f := &funcExec{}
+		if err := (&componentResource{kind: "theme"}).converge(wp(f), model(statePresentInactive)); err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(f.joined(), "deactivate") {
+			t.Fatalf("theme has no deactivate verb; calls:\n%s", f.joined())
+		}
+	})
+
+	t.Run("absent installed deletes", func(t *testing.T) {
+		f := &funcExec{} // all commands succeed → is-installed ok → delete
+		if err := (&componentResource{kind: "plugin"}).converge(wp(f), model(stateAbsent)); err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(f.joined(), "delete") {
+			t.Fatalf("absent+installed should delete; calls:\n%s", f.joined())
+		}
+	})
+
+	t.Run("absent not-installed is a no-op", func(t *testing.T) {
+		f := &funcExec{run: func(cmd string) (string, error) {
+			if strings.Contains(cmd, "is-installed") {
+				return "", errors.New("not installed")
+			}
+			return "", nil
+		}}
+		if err := (&componentResource{kind: "plugin"}).converge(wp(f), model(stateAbsent)); err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(f.joined(), "delete") {
+			t.Fatalf("absent+not-installed must not delete; calls:\n%s", f.joined())
+		}
+	})
+}
 
 func TestComponentInstallTarget(t *testing.T) {
 	if got := componentInstallTarget("wporg", "woocommerce", ""); got != "woocommerce" {
@@ -39,15 +126,28 @@ func TestComponentInstallArgs(t *testing.T) {
 	}
 }
 
-func TestComponentStatusActive(t *testing.T) {
+func TestComponentStatusState(t *testing.T) {
 	for _, s := range []string{"active", "active-network", " active "} {
-		if !componentStatusActive(s) {
-			t.Errorf("%q should be active", s)
+		if got := componentStatusState(s); got != stateActive {
+			t.Errorf("%q → %q, want %q", s, got, stateActive)
 		}
 	}
 	for _, s := range []string{"inactive", "", "must-use"} {
-		if componentStatusActive(s) {
-			t.Errorf("%q should not be active", s)
+		if got := componentStatusState(s); got != statePresentInactive {
+			t.Errorf("%q → %q, want %q", s, got, statePresentInactive)
+		}
+	}
+}
+
+func TestValidComponentState(t *testing.T) {
+	for _, s := range []string{stateActive, statePresentInactive, stateAbsent} {
+		if !validComponentState(s) {
+			t.Errorf("%q should be valid", s)
+		}
+	}
+	for _, s := range []string{"", "enabled", "removed", "ACTIVE"} {
+		if validComponentState(s) {
+			t.Errorf("%q should be invalid", s)
 		}
 	}
 }

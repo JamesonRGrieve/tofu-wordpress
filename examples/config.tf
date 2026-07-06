@@ -35,6 +35,23 @@ resource "wordpress_config" "site" {
     WP_REDIS_DISABLE_COMMENT = "true"
   }
 
+  # WordPressSite hardening / tuning surface (netbox-wordpress fields).
+  # Hidden login (wps-hide-login): installs the plugin and sets whl_page.
+  login_slug = "secret-login"
+
+  # Object cache (Valkey/Redis) instance: defines WP_REDIS_HOST/PORT, installs +
+  # activates redis-cache, and runs `wp redis enable`.
+  object_cache_host = "10.0.0.5"
+  object_cache_port = 6379
+
+  # PHP safe-opt hardening: writes a php.ini drop-in (disable_functions,
+  # allow_url_fopen = Off). Set false to remove the managed drop-in.
+  safe_opt = true
+
+  # Apache: mod_remoteip trusted proxies + HSTS header (shared managed drop-in).
+  trusted_proxies = "10.0.0.1,192.168.1.0/24"
+  enable_hsts     = true
+
   db_password = var.wp_db_password
   salts       = var.wp_salts
 }

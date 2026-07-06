@@ -4,16 +4,27 @@ package provider
 
 import (
 	"context"
+	"fmt"
 	"strings"
 
+	"github.com/JamesonRGrieve/tofu-wordpress/internal/wordpress"
+	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
-	"github.com/hashicorp/terraform-plugin-framework/resource/schema/booldefault"
-	"github.com/hashicorp/terraform-plugin-framework/resource/schema/boolplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringdefault"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/types"
+)
+
+// Declared install-state for a plugin/theme, matching netbox-wordpress
+// PluginStateChoices. `absent` ensures the component is uninstalled (fleet cruft
+// removal, e.g. W3TC/LiteSpeed); the two present states mirror the old bool.
+const (
+	stateActive          = "active"
+	statePresentInactive = "present_inactive"
+	stateAbsent          = "absent"
 )
 
 // componentResource is the shared implementation behind wordpress_plugin and
@@ -35,7 +46,7 @@ type componentModel struct {
 	Path      types.String `tfsdk:"path"`
 	Slug      types.String `tfsdk:"slug"`
 	Version   types.String `tfsdk:"version"`
-	Active    types.Bool   `tfsdk:"active"`
+	State     types.String `tfsdk:"state"`
 	Source    types.String `tfsdk:"source"`
 	SourceURL types.String `tfsdk:"source_url"`
 }
@@ -47,7 +58,7 @@ func (r *componentResource) Metadata(_ context.Context, req resource.MetadataReq
 func (r *componentResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *resource.SchemaResponse) {
 	resp.Schema = schema.Schema{
 		MarkdownDescription: "A WordPress " + r.kind + " managed via `wp " + r.kind +
-			" install/activate/deactivate/delete/update`. Imports to 0-diff by slug.",
+			" install/activate/deactivate/delete/update`. `state=absent` uninstalls it. Imports to 0-diff by slug.",
 		Attributes: map[string]schema.Attribute{
 			"id": schema.StringAttribute{
 				Computed:      true,
@@ -69,12 +80,13 @@ func (r *componentResource) Schema(_ context.Context, _ resource.SchemaRequest, 
 				PlanModifiers:       []planmodifier.String{stringplanmodifier.UseStateForUnknown()},
 				MarkdownDescription: "Pinned version; blank installs/tracks the latest.",
 			},
-			"active": schema.BoolAttribute{
-				Optional:            true,
-				Computed:            true,
-				Default:             booldefault.StaticBool(true),
-				PlanModifiers:       []planmodifier.Bool{boolplanmodifier.UseStateForUnknown()},
-				MarkdownDescription: "Whether the " + r.kind + " is activated (default true).",
+			"state": schema.StringAttribute{
+				Optional:      true,
+				Computed:      true,
+				Default:       stringdefault.StaticString(stateActive),
+				PlanModifiers: []planmodifier.String{stringplanmodifier.UseStateForUnknown()},
+				MarkdownDescription: "Declared install-state: `active` (default), `present_inactive`, or " +
+					"`absent` (uninstall). For a theme, `present_inactive` means installed but not the current theme.",
 			},
 			"source": schema.StringAttribute{
 				Optional:            true,
@@ -105,20 +117,69 @@ func (r *componentResource) Create(ctx context.Context, req resource.CreateReque
 	if resp.Diagnostics.HasError() {
 		return
 	}
+	r.apply(ctx, &m, &resp.State, &resp.Diagnostics)
+}
+
+func (r *componentResource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
+	var m componentModel
+	resp.Diagnostics.Append(req.Plan.Get(ctx, &m)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	r.apply(ctx, &m, &resp.State, &resp.Diagnostics)
+}
+
+// apply converges the component to m.State and records the observed result so a
+// re-apply is a no-op. Shared by Create and Update.
+func (r *componentResource) apply(ctx context.Context, m *componentModel, state stateSetter, diags *diag.Diagnostics) {
+	st := m.State.ValueString()
+	if !validComponentState(st) {
+		diags.AddError("invalid "+r.kind+" state",
+			fmt.Sprintf("state must be one of %s, %s, %s; got %q", stateActive, statePresentInactive, stateAbsent, st))
+		return
+	}
 	p := resolvePath(m.Path, r.docroot())
 	if r.client != nil && r.client.SSH != nil {
-		wp := r.client.wp(p)
-		target := componentInstallTarget(m.Source.ValueString(), m.Slug.ValueString(), m.SourceURL.ValueString())
-		args := componentInstallArgs(r.kind, target, m.Version.ValueString(), m.Active.ValueBool())
-		if _, err := wp.Command(args...); err != nil {
-			resp.Diagnostics.AddError("wp "+r.kind+" install failed", err.Error())
+		if err := r.converge(r.client.wp(p), m); err != nil {
+			diags.AddError("wp "+r.kind+" "+st+" failed", err.Error())
 			return
 		}
-		r.refresh(&m, p)
+		r.refresh(m, p)
+	}
+	if m.Version.IsNull() || m.Version.IsUnknown() {
+		m.Version = types.StringValue("")
 	}
 	m.Path = types.StringValue(p)
 	m.ID = types.StringValue(componentID(p, m.Slug.ValueString()))
-	resp.Diagnostics.Append(resp.State.Set(ctx, &m)...)
+	diags.Append(state.Set(ctx, m)...)
+}
+
+// converge runs the WP-CLI commands that bring the component to m.State.
+func (r *componentResource) converge(wp *wordpress.WPCLI, m *componentModel) error {
+	slug := m.Slug.ValueString()
+	if m.State.ValueString() == stateAbsent {
+		if _, err := wp.Command(r.kind, "is-installed", slug); err != nil {
+			return nil // already absent
+		}
+		_, err := wp.Command(r.kind, "delete", slug)
+		return err
+	}
+	active := m.State.ValueString() == stateActive
+	target := componentInstallTarget(m.Source.ValueString(), slug, m.SourceURL.ValueString())
+	if _, err := wp.Command(componentInstallArgs(r.kind, target, m.Version.ValueString(), active)...); err != nil {
+		return err
+	}
+	if active {
+		_, err := wp.Command(r.kind, "activate", slug)
+		return err
+	}
+	// present_inactive: a plugin is deactivated; a theme has no deactivate verb
+	// (it is simply not the active theme), so install-without-activate suffices.
+	if r.kind == "plugin" {
+		_, err := wp.Command(r.kind, "deactivate", slug)
+		return err
+	}
+	return nil
 }
 
 func (r *componentResource) Read(ctx context.Context, req resource.ReadRequest, resp *resource.ReadResponse) {
@@ -133,39 +194,11 @@ func (r *componentResource) Read(ctx context.Context, req resource.ReadRequest, 
 	p := resolvePath(m.Path, r.docroot())
 	wp := r.client.wp(p)
 	if _, err := wp.Command(r.kind, "is-installed", m.Slug.ValueString()); err != nil {
-		resp.State.RemoveResource(ctx)
-		return
-	}
-	r.refresh(&m, p)
-	m.Path = types.StringValue(p)
-	m.ID = types.StringValue(componentID(p, m.Slug.ValueString()))
-	resp.Diagnostics.Append(resp.State.Set(ctx, &m)...)
-}
-
-func (r *componentResource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
-	var m componentModel
-	resp.Diagnostics.Append(req.Plan.Get(ctx, &m)...)
-	if resp.Diagnostics.HasError() {
-		return
-	}
-	p := resolvePath(m.Path, r.docroot())
-	if r.client != nil && r.client.SSH != nil {
-		wp := r.client.wp(p)
-		slug := m.Slug.ValueString()
-		if v := m.Version.ValueString(); v != "" {
-			if _, err := wp.Command(r.kind, "update", slug, "--version="+v); err != nil {
-				resp.Diagnostics.AddError("wp "+r.kind+" update failed", err.Error())
-				return
-			}
-		}
-		activateCmd := "deactivate"
-		if m.Active.ValueBool() {
-			activateCmd = "activate"
-		}
-		if _, err := wp.Command(r.kind, activateCmd, slug); err != nil {
-			resp.Diagnostics.AddError("wp "+r.kind+" "+activateCmd+" failed", err.Error())
-			return
-		}
+		// Not installed → observed state is absent (drift surfaces if the desired
+		// state is a present one; a no-op if the desired state is absent).
+		m.State = types.StringValue(stateAbsent)
+		m.Version = types.StringValue("")
+	} else {
 		r.refresh(&m, p)
 	}
 	m.Path = types.StringValue(p)
@@ -183,6 +216,11 @@ func (r *componentResource) Delete(ctx context.Context, req resource.DeleteReque
 		return
 	}
 	wp := r.client.wp(resolvePath(m.Path, r.docroot()))
+	// Only delete if still installed, so removing an already-absent resource
+	// (state=absent) from config is not an error.
+	if _, err := wp.Command(r.kind, "is-installed", m.Slug.ValueString()); err != nil {
+		return
+	}
 	if _, err := wp.Command(r.kind, "delete", m.Slug.ValueString()); err != nil {
 		resp.Diagnostics.AddError("wp "+r.kind+" delete failed", err.Error())
 	}
@@ -197,7 +235,9 @@ func (r *componentResource) ImportState(ctx context.Context, req resource.Import
 	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("id"), req.ID)...)
 }
 
-// refresh reads the live version/active state into the model (best-effort).
+// refresh reads the live version/state into the model (best-effort). Called only
+// when the component is installed, so the observed state is one of the present
+// values.
 func (r *componentResource) refresh(m *componentModel, p string) {
 	wp := r.client.wp(p)
 	slug := m.Slug.ValueString()
@@ -205,11 +245,16 @@ func (r *componentResource) refresh(m *componentModel, p string) {
 		m.Version = types.StringValue(v)
 	}
 	if s, err := wp.Command(r.kind, "get", slug, "--field=status"); err == nil {
-		m.Active = types.BoolValue(componentStatusActive(s))
+		m.State = types.StringValue(componentStatusState(s))
 	}
 }
 
 // ── pure helpers (unit-tested) ───────────────────────────────────────────────
+
+// validComponentState reports whether s is one of the three declared states.
+func validComponentState(s string) bool {
+	return s == stateActive || s == statePresentInactive || s == stateAbsent
+}
 
 // componentInstallTarget selects the `wp <kind> install` argument: the source
 // URL/zip path for non-wporg sources, else the slug.
@@ -233,10 +278,14 @@ func componentInstallArgs(kind, target, version string, activate bool) []string 
 	return args
 }
 
-// componentStatusActive maps a `wp <kind> get --field=status` value to a bool.
-// Both plugins and themes report "active"/"active-network"/… when enabled.
-func componentStatusActive(status string) bool {
-	return strings.HasPrefix(strings.TrimSpace(status), "active")
+// componentStatusState maps a `wp <kind> get --field=status` value to the
+// declared present state: "active"/"active-network"/… ⇒ active, else
+// present_inactive. Called only for an installed component.
+func componentStatusState(status string) string {
+	if strings.HasPrefix(strings.TrimSpace(status), "active") {
+		return stateActive
+	}
+	return statePresentInactive
 }
 
 // componentID is the resource id: "<path>/<slug>".

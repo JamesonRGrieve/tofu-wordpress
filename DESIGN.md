@@ -121,19 +121,67 @@ real HTTP-200 gate, but a green plan is not proof — the lab-twin drill (see
 provider never applies to a device directly; the device-apply paths are exercised
 in unit tests exclusively through an injected fake executor.
 
-## Fleet / hardening parity roadmap
+## netbox-wordpress SoT consumption
+
+netbox-wordpress is the source of truth; the consumer layer reads its REST API and
+drives these resources. The mapping of each SoT field to what converges it:
+
+| netbox-wordpress field | Converged by |
+|---|---|
+| `WordPressPlugin/Theme.state` (absent/present_inactive/active) | `wordpress_plugin` / `wordpress_theme` `state` — **`absent` uninstalls** (fleet cruft removal) |
+| `WordPressConstant`, hardening defines | `wordpress_config.constants` (manage-declared-only) |
+| `WordPressSite.install_path` (docroot) | `wordpress_config.path` (and the other resources' `path`), defaulting to the provider `docroot` |
+| `WordPressSite.login_slug` (wps-hide-login `whl_page`) | `wordpress_config.login_slug` — installs+activates wps-hide-login and sets `whl_page`; blank leaves the default `wp-login.php` |
+| `WordPressSite.object_cache_instance` (Valkey/Redis) | `wordpress_config.object_cache_host` / `object_cache_port` — defines `WP_REDIS_HOST`/`WP_REDIS_PORT`, installs+activates redis-cache, runs `wp redis enable` (the backend host/port from the FK are resolved at the consumer layer) |
+| `WordPressSite.safe_opt` (PHP hardening) | `wordpress_config.safe_opt` — a managed php.ini drop-in (`disable_functions`, `allow_url_fopen = Off`) |
+| `WordPressSite.trusted_proxies` (mod_remoteip) | `wordpress_config.trusted_proxies` — an Apache mod_remoteip drop-in (`RemoteIPHeader X-Forwarded-For` + `RemoteIPTrustedProxy`) |
+| `WordPressSite.enable_hsts` | `wordpress_config.enable_hsts` — an Apache mod_headers `Strict-Transport-Security` stanza (shares the managed Apache drop-in with `trusted_proxies`) |
+| system cron form | `wordpress_cron` `mode` — `wp_cli` renders `wp cron event run --due-now` (the live fleet form), `wp_cron_php` the greenfield form; both import to 0-diff |
+| `WordPressContentDirectory` (wp-content move) | `wordpress_content_dir` (staged, rollback-armed) |
+
+### Managed hardening drop-ins
+
+`safe_opt`, `trusted_proxies`, and `enable_hsts` are realized as **provider-managed
+files** written over the transport, each carrying a `# Managed by OpenTofu` marker
+and rendered by a pure, unit-tested function in `internal/wordpress/hardening.go`:
+
+- **`safe_opt`** → a php.ini drop-in at `php_ini_path` (default
+  `/etc/php/conf.d/zz-wp-hardening.ini`). `safe_opt = false` removes the managed
+  drop-in.
+- **`trusted_proxies` + `enable_hsts`** → a single Apache drop-in at
+  `apache_conf_path` (default `/etc/apache2/conf-enabled/zz-wp-hardening.conf`)
+  composing the mod_remoteip and mod_headers stanzas. When neither contributes any
+  content (blank proxies + HSTS off) the managed file is removed.
+
+Both paths are `Optional+Computed` attributes so a distro with a different conf
+layout retargets them declaratively. The renderers are pure; the resource's write
+side goes through the injected transport and is exercised in a hermetic test
+(`TestApplySiteConfig`) that records the command sequence without contacting a
+device.
+
+## Boundary — what this provider does NOT own (host/OS layer)
+
+A deliberate scope line, matching the provider's WP-CLI-over-SSH transport: the
+following netbox-wordpress fields describe broad **node-OS / fleet** state, not
+per-site WordPress state, so they are converged by the **Ansible baremetal role /
+a future host (`proxmox_host_config`) resource**, NOT here. netbox-wordpress
+remains their SoT; this provider simply is not their consumer.
+
+- `WordPressSite.fpm_profile` (PHP-FPM pool / OPcache sizing tiers) and the
+  `prod_hardening` **umbrella** (fail2ban, unattended-upgrades, AIDE, rkhunter,
+  Cloudflare-range allowlists, and other node-wide OS hardening) — fleet/OS
+  surfaces sized from the host, not a single install. The narrow, per-site Apache /
+  PHP drop-ins that used to sit under this umbrella — `safe_opt`,
+  `trusted_proxies`, `enable_hsts` — are now realized **here** by `wordpress_config`
+  (see the SoT table above); the WordPress-side defines that pair with them (e.g.
+  `FORCE_SSL_ADMIN`) remain expressible via `wordpress_config.constants`.
+- `WordPressSite.install_path` as a **whole-install / vhost DocumentRoot
+  relocation** (e.g. moving WP **core** from `/var/www/html/wordpress` →
+  `/var/www/html` and repointing the Apache vhost) is an Apache/filesystem
+  operation outside a WP-CLI provider's remit; it stays the
+  `wp-docroot-standardize.sh` normalizer / host layer. This provider consumes
+  `install_path` only as the **docroot** (`wordpress_config.path` et al.);
+  contrast `wordpress_content_dir`, which relocates only `wp-content` — a pure
+  WP-CLI + rsync operation this provider *does* own.
 
 The reference deployment is `ansible/playbooks/applications/wordpress/baremetal/`.
-This provider covers install-state, wp-config defines, cron, and content-dir; the
-following parity items are tracked in `todo.json`:
-
-- **FPM/OPcache traffic tiers** (`low`/`medium`/`high`) and `wordpress_prod_hardening`
-  (fail2ban, mod_remoteip/Cloudflare ranges, unattended-upgrades, AIDE, rkhunter,
-  Apache/PHP hardening drop-ins) live in Ansible today; the node-OS hardening
-  belongs behind `proxmox_host_config` / a future host resource, the WordPress-side
-  defines are already expressible via `wordpress_config`.
-- The production cron invokes `wp cron event run --due-now` as the web user; this
-  provider renders a `wp-cron.php`-via-PHP cron.d entry (per the resource spec).
-  Reconciling the two forms is a tracked parity item.
-- Object cache (Valkey/Redis) `WP_REDIS_*` defines are covered by `wordpress_config`;
-  installing/enabling the Redis Object Cache plugin is covered by `wordpress_plugin`.

@@ -25,10 +25,11 @@ relocation orchestration that a `local-exec` script cannot.
 | Resource | Manages | WP-CLI / mechanism |
 |---|---|---|
 | `wordpress_core` | Core install/update | `wp core version` / `download` / `install` / `update --version=` |
-| `wordpress_config` | `wp-config.php` defines (manage-declared-only) | `wp config get` / `set` (`--raw` for bool/int constants) |
-| `wordpress_plugin` | A plugin (install/activate/version/delete) | `wp plugin install/activate/deactivate/update/delete/get` |
-| `wordpress_theme` | A theme (same shape) | `wp theme …` (shares the plugin implementation) |
-| `wordpress_cron` | System cron for wp-cron | `/etc/cron.d` entry running `wp-cron.php` (pairs with `DISABLE_WP_CRON=true`) |
+| `wordpress_config` | `wp-config.php` defines (manage-declared-only) + the WordPressSite hardening/tuning surface: `login_slug` (wps-hide-login), `object_cache_host`/`object_cache_port` (Redis/Valkey), `safe_opt` (PHP ini drop-in), `trusted_proxies` (Apache mod_remoteip), `enable_hsts` | `wp config get`/`set` (`--raw` for bool/int) + `wp option`/`plugin` + managed php.ini / Apache drop-ins |
+| `wordpress_plugin` | A plugin — `state` = `active` / `present_inactive` / `absent` (uninstall) | `wp plugin install/activate/deactivate/update/delete/get` |
+| `wordpress_theme` | A theme (same `state` shape; `present_inactive` = installed, not current) | `wp theme …` (shares the plugin implementation) |
+| `wordpress_option` | A single `wp_options` row (e.g. wps-hide-login `whl_page`) | `wp option get` / `update` / `delete` |
+| `wordpress_cron` | System cron for wp-cron — `mode` = `wp_cron_php` / `wp_cli` | `/etc/cron.d` entry running `wp-cron.php` or `wp cron event run --due-now` (pairs with `DISABLE_WP_CRON=true`) |
 | `wordpress_content_dir` | Content directory + **safe relocation** | staged rsync + verify + config repoint + health check + rollback |
 
 ## Import IDs
@@ -39,6 +40,7 @@ relocation orchestration that a `local-exec` script cannot.
 | `wordpress_config` | `<docroot>` | `tofu import wordpress_config.site /var/www/html` |
 | `wordpress_plugin` | `<docroot>/<slug>` (or bare `<slug>`) | `tofu import wordpress_plugin.wc /var/www/html/woocommerce` |
 | `wordpress_theme` | `<docroot>/<slug>` | `tofu import wordpress_theme.sf /var/www/html/storefront` |
+| `wordpress_option` | `<docroot>#<name>` (or bare `<name>`) | `tofu import wordpress_option.login /var/www/html#whl_page` |
 | `wordpress_cron` | `<docroot>` | `tofu import wordpress_cron.site /var/www/html` |
 | `wordpress_content_dir` | `<docroot>` | `tofu import wordpress_content_dir.site /var/www/html` |
 
@@ -58,10 +60,13 @@ persisted. Supply them from OpenBao via `TF_VAR_*` (or an ephemeral
 At the `tofu/` consumer layer this provider reads its intent from **NetBox**, the
 single source of truth — never from hand-maintained tfvars:
 
-- **`netbox-wordpress`** — a `WordPressSite` object supplies the docroot, site
-  URL, core version, plugin/theme set, and the cron cadence; a
-  `WordPressContentDirectory` object supplies `content_dir` / `target_content_dir`
-  / `uploads_dir` / `content_url` for `wordpress_content_dir`.
+- **`netbox-wordpress`** — a `WordPressSite` object supplies the docroot
+  (`install_path` → `path`), site URL, core version, plugin/theme set (each with a
+  tri-state `state`: `active` / `present_inactive` / `absent`), the cron cadence,
+  and the hardening/tuning surface (`login_slug`, `object_cache_instance` →
+  `object_cache_host`/`object_cache_port`, `safe_opt`, `trusted_proxies`,
+  `enable_hsts`); a `WordPressContentDirectory` object supplies `content_dir` /
+  `target_content_dir` / `uploads_dir` / `content_url` for `wordpress_content_dir`.
 - **`netbox-database`** — `DatabaseUser.credential_ref` points at the OpenBao path
   holding `DB_PASSWORD`; the consumer reads it with an ephemeral vault resource
   and passes it to `wordpress_config.db_password`.

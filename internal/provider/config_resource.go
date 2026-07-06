@@ -4,6 +4,7 @@ package provider
 
 import (
 	"context"
+	"fmt"
 	"sort"
 
 	"github.com/JamesonRGrieve/tofu-wordpress/internal/wordpress"
@@ -12,6 +13,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringdefault"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 )
@@ -30,20 +32,36 @@ var (
 // NewConfigResource constructs the wordpress_config resource.
 func NewConfigResource() resource.Resource { return &configResource{} }
 
+// Default drop-in paths for the file-based hardening surface. Both are
+// overridable per resource so a distro with a different conf layout can retarget
+// them; the defaults suit a Debian/Apache + PHP install.
+const (
+	defaultPHPHardeningINIPath = "/etc/php/conf.d/zz-wp-hardening.ini"
+	defaultApacheHardeningPath = "/etc/apache2/conf-enabled/zz-wp-hardening.conf"
+)
+
 type configResource struct {
 	client *providerClient
 }
 
 type configModel struct {
-	ID          types.String `tfsdk:"id"`
-	Path        types.String `tfsdk:"path"`
-	Constants   types.Map    `tfsdk:"constants"`
-	TablePrefix types.String `tfsdk:"table_prefix"`
-	DBName      types.String `tfsdk:"db_name"`
-	DBUser      types.String `tfsdk:"db_user"`
-	DBHost      types.String `tfsdk:"db_host"`
-	DBPassword  types.String `tfsdk:"db_password"`
-	Salts       types.Map    `tfsdk:"salts"`
+	ID              types.String `tfsdk:"id"`
+	Path            types.String `tfsdk:"path"`
+	Constants       types.Map    `tfsdk:"constants"`
+	TablePrefix     types.String `tfsdk:"table_prefix"`
+	DBName          types.String `tfsdk:"db_name"`
+	DBUser          types.String `tfsdk:"db_user"`
+	DBHost          types.String `tfsdk:"db_host"`
+	DBPassword      types.String `tfsdk:"db_password"`
+	Salts           types.Map    `tfsdk:"salts"`
+	LoginSlug       types.String `tfsdk:"login_slug"`
+	ObjectCacheHost types.String `tfsdk:"object_cache_host"`
+	ObjectCachePort types.Int64  `tfsdk:"object_cache_port"`
+	SafeOpt         types.Bool   `tfsdk:"safe_opt"`
+	TrustedProxies  types.String `tfsdk:"trusted_proxies"`
+	EnableHSTS      types.Bool   `tfsdk:"enable_hsts"`
+	PHPIniPath      types.String `tfsdk:"php_ini_path"`
+	ApacheConfPath  types.String `tfsdk:"apache_conf_path"`
 }
 
 func (r *configResource) Metadata(_ context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
@@ -101,6 +119,48 @@ func (r *configResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 				WriteOnly:   true,
 				MarkdownDescription: "AUTH_KEY/SECURE_AUTH_KEY/…/NONCE_SALT as name→value. WRITE-ONLY: injected from " +
 					"OpenBao at apply, never stored in state.",
+			},
+			"login_slug": schema.StringAttribute{
+				Optional: true,
+				MarkdownDescription: "Hidden-login slug (netbox-wordpress `login_slug`). When set, installs+activates " +
+					"wps-hide-login and sets its `whl_page` option to this slug; unset leaves the default `wp-login.php`.",
+			},
+			"object_cache_host": schema.StringAttribute{
+				Optional: true,
+				MarkdownDescription: "Object-cache (Valkey/Redis) host from the netbox-wordpress " +
+					"`object_cache_instance`. When set, WP_REDIS_HOST is defined, the redis-cache drop-in is " +
+					"installed+activated (`wp redis enable`).",
+			},
+			"object_cache_port": schema.Int64Attribute{
+				Optional:            true,
+				MarkdownDescription: "Object-cache port → WP_REDIS_PORT. Omit to leave the plugin default (6379).",
+			},
+			"safe_opt": schema.BoolAttribute{
+				Optional: true,
+				MarkdownDescription: "PHP safe-opt hardening (netbox-wordpress `safe_opt`): writes a php.ini drop-in " +
+					"disabling the process-exec functions and `allow_url_fopen`. `false` removes the managed drop-in.",
+			},
+			"trusted_proxies": schema.StringAttribute{
+				Optional: true,
+				MarkdownDescription: "Comma-separated trusted proxy IPs/CIDRs (netbox-wordpress `trusted_proxies`) → an " +
+					"Apache mod_remoteip stanza (RemoteIPHeader X-Forwarded-For + RemoteIPTrustedProxy).",
+			},
+			"enable_hsts": schema.BoolAttribute{
+				Optional: true,
+				MarkdownDescription: "Emit the Strict-Transport-Security header (netbox-wordpress `enable_hsts`) via an " +
+					"Apache mod_headers stanza. Shares the managed Apache drop-in with `trusted_proxies`.",
+			},
+			"php_ini_path": schema.StringAttribute{
+				Optional:            true,
+				Computed:            true,
+				Default:             stringdefault.StaticString(defaultPHPHardeningINIPath),
+				MarkdownDescription: "Target path for the `safe_opt` php.ini drop-in. Default `" + defaultPHPHardeningINIPath + "`.",
+			},
+			"apache_conf_path": schema.StringAttribute{
+				Optional:            true,
+				Computed:            true,
+				Default:             stringdefault.StaticString(defaultApacheHardeningPath),
+				MarkdownDescription: "Target path for the `trusted_proxies`/`enable_hsts` Apache drop-in. Default `" + defaultApacheHardeningPath + "`.",
 			},
 		},
 	}
@@ -183,10 +243,68 @@ func (r *configResource) write(ctx context.Context, plan planGetter, config attr
 				return
 			}
 		}
+		if err := applySiteConfig(&m, wp, r.client.SSH); err != nil {
+			diags.AddError("apply WordPress site config failed", err.Error())
+			return
+		}
 	}
 	m.Path = types.StringValue(p)
 	m.ID = types.StringValue(p)
 	diags.Append(state.Set(ctx, &m)...)
+}
+
+// applySiteConfig converges the WordPressSite hardening/tuning surface —
+// object-cache defines + redis-cache plugin, wps-hide-login slug, the safe_opt
+// php.ini drop-in, and the trusted_proxies/enable_hsts Apache drop-in. wp drives
+// WP-CLI; exec writes the managed drop-in files (both go through the same
+// injected transport so the whole sequence is unit-tested without a device).
+// Manage-declared-only: a null attribute is left untouched; an explicit
+// false/blank removes what the provider previously wrote.
+func applySiteConfig(m *configModel, wp *wordpress.WPCLI, exec wordpress.Executor) error {
+	if !m.ObjectCacheHost.IsNull() && m.ObjectCacheHost.ValueString() != "" {
+		defs := wordpress.RedisCacheDefines(m.ObjectCacheHost.ValueString(), m.ObjectCachePort.ValueInt64())
+		for _, name := range sortedKeys(defs) {
+			if err := wp.ConfigSet(name, defs[name], wordpress.IsRawConstant(name)); err != nil {
+				return fmt.Errorf("set %s: %w", name, err)
+			}
+		}
+		if _, err := wp.Command("plugin", "install", "redis-cache", "--activate"); err != nil {
+			return fmt.Errorf("install redis-cache: %w", err)
+		}
+		if _, err := wp.Command("redis", "enable"); err != nil {
+			return fmt.Errorf("wp redis enable: %w", err)
+		}
+	}
+	if !m.LoginSlug.IsNull() && m.LoginSlug.ValueString() != "" {
+		if _, err := wp.Command("plugin", "install", "wps-hide-login", "--activate"); err != nil {
+			return fmt.Errorf("install wps-hide-login: %w", err)
+		}
+		if _, err := wp.Command(wordpress.LoginSlugOptionArgs(m.LoginSlug.ValueString())...); err != nil {
+			return fmt.Errorf("set whl_page: %w", err)
+		}
+	}
+	if !m.SafeOpt.IsNull() {
+		iniPath := m.PHPIniPath.ValueString()
+		if m.SafeOpt.ValueBool() {
+			if _, err := exec.Run(wordpress.WriteFileCommand(iniPath), []byte(wordpress.RenderPHPHardeningINI())); err != nil {
+				return fmt.Errorf("write php hardening ini: %w", err)
+			}
+		} else if _, err := exec.Run(wordpress.RemoveFileCommand(iniPath), nil); err != nil {
+			return fmt.Errorf("remove php hardening ini: %w", err)
+		}
+	}
+	if !m.TrustedProxies.IsNull() || !m.EnableHSTS.IsNull() {
+		conf := wordpress.RenderApacheHardeningConf(m.TrustedProxies.ValueString(), m.EnableHSTS.ValueBool())
+		confPath := m.ApacheConfPath.ValueString()
+		if conf != "" {
+			if _, err := exec.Run(wordpress.WriteFileCommand(confPath), []byte(conf)); err != nil {
+				return fmt.Errorf("write apache hardening conf: %w", err)
+			}
+		} else if _, err := exec.Run(wordpress.RemoveFileCommand(confPath), nil); err != nil {
+			return fmt.Errorf("remove apache hardening conf: %w", err)
+		}
+	}
+	return nil
 }
 
 func (r *configResource) Read(ctx context.Context, req resource.ReadRequest, resp *resource.ReadResponse) {
@@ -236,6 +354,20 @@ func (r *configResource) Read(ctx context.Context, req resource.ReadRequest, res
 	if !m.TablePrefix.IsNull() {
 		if v, err := wp.Command("config", "get", "table_prefix", "--type=variable"); err == nil {
 			m.TablePrefix = types.StringValue(v)
+		}
+	}
+	// Refresh the cheaply-readable new fields for import-to-0-diff. The
+	// file-based booleans (safe_opt/enable_hsts) and trusted_proxies are
+	// write-managed drop-ins fully overwritten each apply; state keeps the
+	// declared intent so a re-apply converges without a spurious diff.
+	if !m.LoginSlug.IsNull() {
+		if v, err := wp.OptionGet("whl_page"); err == nil && v != "" {
+			m.LoginSlug = types.StringValue(v)
+		}
+	}
+	if !m.ObjectCacheHost.IsNull() {
+		if v, err := wp.ConfigGet("WP_REDIS_HOST"); err == nil {
+			m.ObjectCacheHost = types.StringValue(v)
 		}
 	}
 	resp.Diagnostics.Append(resp.State.Set(ctx, &m)...)
