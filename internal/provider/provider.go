@@ -135,6 +135,8 @@ func (p *wordpressProvider) Resources(_ context.Context) []func() resource.Resou
 		NewConfigResource,
 		NewPluginResource,
 		NewThemeResource,
+		NewOptionResource,
+		NewMuPluginResource,
 		NewCronResource,
 		NewContentDirResource,
 	}

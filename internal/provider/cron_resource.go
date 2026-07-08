@@ -29,7 +29,9 @@ var (
 const (
 	defaultCronMinute = "*/5"
 	defaultPHPBinary  = "/usr/bin/php"
+	defaultWPBinary   = "/usr/bin/wp"
 	defaultCronUser   = "www-data"
+	defaultCronMode   = wordpress.CronModeWPCronPHP
 )
 
 // NewCronResource constructs the wordpress_cron resource.
@@ -43,7 +45,9 @@ type cronModel struct {
 	ID        types.String `tfsdk:"id"`
 	Path      types.String `tfsdk:"path"`
 	Minute    types.String `tfsdk:"minute"`
+	Mode      types.String `tfsdk:"mode"`
 	PHPBinary types.String `tfsdk:"php_binary"`
+	WPBinary  types.String `tfsdk:"wp_binary"`
 	User      types.String `tfsdk:"user"`
 }
 
@@ -72,11 +76,26 @@ func (r *cronResource) Schema(_ context.Context, _ resource.SchemaRequest, resp 
 				Default:             stringdefault.StaticString(defaultCronMinute),
 				MarkdownDescription: "Cron minute field (default `" + defaultCronMinute + "`).",
 			},
+			"mode": schema.StringAttribute{
+				Optional:      true,
+				Computed:      true,
+				Default:       stringdefault.StaticString(defaultCronMode),
+				PlanModifiers: []planmodifier.String{stringplanmodifier.UseStateForUnknown()},
+				MarkdownDescription: "Command form: `" + wordpress.CronModeWPCronPHP + "` (default, runs wp-cron.php " +
+					"via PHP) or `" + wordpress.CronModeWPCLI + "` (runs `wp cron event run --due-now` — the live " +
+					"fleet's form). Set `wp_cli` to import a fleet host to 0-diff.",
+			},
 			"php_binary": schema.StringAttribute{
 				Optional:            true,
 				Computed:            true,
 				Default:             stringdefault.StaticString(defaultPHPBinary),
-				MarkdownDescription: "PHP binary that runs wp-cron.php (default `" + defaultPHPBinary + "`).",
+				MarkdownDescription: "PHP binary that runs wp-cron.php in `wp_cron_php` mode (default `" + defaultPHPBinary + "`).",
+			},
+			"wp_binary": schema.StringAttribute{
+				Optional:            true,
+				Computed:            true,
+				Default:             stringdefault.StaticString(defaultWPBinary),
+				MarkdownDescription: "WP-CLI binary used in `wp_cli` mode (default `" + defaultWPBinary + "`; note CT 322 uses /usr/local/bin/wp).",
 			},
 			"user": schema.StringAttribute{
 				Optional:            true,
@@ -121,7 +140,8 @@ func (r *cronResource) apply(ctx context.Context, m *cronModel, state stateSette
 	p := resolvePath(m.Path, r.docroot())
 	file := cronFilePath(p)
 	if r.client != nil && r.client.SSH != nil {
-		content := wordpress.RenderCronEntry(m.Minute.ValueString(), m.User.ValueString(), m.PHPBinary.ValueString(), p)
+		content := wordpress.RenderCronEntry(m.Minute.ValueString(), m.User.ValueString(),
+			m.PHPBinary.ValueString(), m.WPBinary.ValueString(), p, m.Mode.ValueString())
 		cmd := "cat > " + shellQuote(file)
 		if _, err := r.client.SSH.Run(cmd, []byte(content)); err != nil {
 			diags.AddError("write wordpress cron file failed", err.Error())
@@ -154,6 +174,9 @@ func (r *cronResource) Read(ctx context.Context, req resource.ReadRequest, resp 
 		// File gone → drop from state so it is recreated.
 		resp.State.RemoveResource(ctx)
 		return
+	}
+	if mode := wordpress.ParseCronMode(string(out)); mode != "" {
+		m.Mode = types.StringValue(mode)
 	}
 	resp.Diagnostics.Append(resp.State.Set(ctx, &m)...)
 }

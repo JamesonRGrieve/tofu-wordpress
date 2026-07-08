@@ -26,8 +26,8 @@ func TestProviderMetadata(t *testing.T) {
 func TestProviderResources(t *testing.T) {
 	p := New("dev")().(*wordpressProvider)
 	got := p.Resources(context.Background())
-	if len(got) != 6 {
-		t.Fatalf("expected 6 resources, got %d", len(got))
+	if len(got) != 8 {
+		t.Fatalf("expected 8 resources, got %d", len(got))
 	}
 	// Every registered resource must produce a distinct wordpress_* type name.
 	seen := map[string]bool{}

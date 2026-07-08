@@ -28,7 +28,8 @@ relocation orchestration that a `local-exec` script cannot.
 | `wordpress_config` | `wp-config.php` defines (manage-declared-only) + the WordPressSite hardening/tuning surface: `login_slug` (wps-hide-login), `object_cache_host`/`object_cache_port` (Redis/Valkey), `safe_opt` (PHP ini drop-in), `trusted_proxies` (Apache mod_remoteip), `enable_hsts` | `wp config get`/`set` (`--raw` for bool/int) + `wp option`/`plugin` + managed php.ini / Apache drop-ins |
 | `wordpress_plugin` | A plugin — `state` = `active` / `present_inactive` / `absent` (uninstall) | `wp plugin install/activate/deactivate/update/delete/get` |
 | `wordpress_theme` | A theme (same `state` shape; `present_inactive` = installed, not current) | `wp theme …` (shares the plugin implementation) |
-| `wordpress_option` | A single `wp_options` row (e.g. wps-hide-login `whl_page`) | `wp option get` / `update` / `delete` |
+| `wordpress_option` | A single `wp_options` row — `format` = `string` / `json` (a serialized plugin-settings array) | `wp option get`/`update`/`delete` (`--format=json` for structured settings) |
+| `wordpress_muplugin` | A must-use plugin file (`wp-content/mu-plugins/<name>`) by full content | SSH file write; the home for the shim mu-plugins the integrations deploy |
 | `wordpress_cron` | System cron for wp-cron — `mode` = `wp_cron_php` / `wp_cli` | `/etc/cron.d` entry running `wp-cron.php` or `wp cron event run --due-now` (pairs with `DISABLE_WP_CRON=true`) |
 | `wordpress_content_dir` | Content directory + **safe relocation** | staged rsync + verify + config repoint + health check + rollback |
 
@@ -41,6 +42,7 @@ relocation orchestration that a `local-exec` script cannot.
 | `wordpress_plugin` | `<docroot>/<slug>` (or bare `<slug>`) | `tofu import wordpress_plugin.wc /var/www/html/woocommerce` |
 | `wordpress_theme` | `<docroot>/<slug>` | `tofu import wordpress_theme.sf /var/www/html/storefront` |
 | `wordpress_option` | `<docroot>#<name>` (or bare `<name>`) | `tofu import wordpress_option.login /var/www/html#whl_page` |
+| `wordpress_muplugin` | `<docroot>#<name>` (or bare `<name>`) | `tofu import wordpress_muplugin.matomo /var/www/html#zz-matomo.php` |
 | `wordpress_cron` | `<docroot>` | `tofu import wordpress_cron.site /var/www/html` |
 | `wordpress_content_dir` | `<docroot>` | `tofu import wordpress_content_dir.site /var/www/html` |
 
