@@ -12,7 +12,10 @@
 // existing SSH machinery (OpenBao-signed certs / agent / ssh_config). A private
 // key is only ever materialized when key_pem is supplied (written to a temp
 // 0600 file per call, removed after); key_file and ssh_config paths never touch
-// the material. Auth is key/cert ONLY — never a password.
+// the material. Auth is key/cert by default; a password (SSHConfig.Password, e.g.
+// a per-guest root pw from OpenBao) is supported for the password-only CT fleet
+// via `sshpass -e` (password in $SSHPASS, never argv) and is used only when no
+// key material is supplied.
 package wordpress
 
 import (
@@ -29,27 +32,36 @@ import (
 
 // SSHConfig configures the SSH transport. All fields optional except Host.
 type SSHConfig struct {
-	Host    string // host or host:port, no scheme
-	Port    int    // SSH port (0 → use Host's :port or ssh default)
-	User    string // SSH user (default "root")
-	KeyFile string // identity file (ssh -i); ssh_config/agent used when empty
-	KeyPEM  string // private-key material (e.g. from OpenBao); temp 0600 file per call
-	Timeout time.Duration
+	Host     string // host or host:port, no scheme
+	Port     int    // SSH port (0 → use Host's :port or ssh default)
+	User     string // SSH user (default "root")
+	KeyFile  string // identity file (ssh -i); ssh_config/agent used when empty
+	KeyPEM   string // private-key material (e.g. from OpenBao); temp 0600 file per call
+	Password string // SSH password (e.g. a per-guest root pw from OpenBao); fed to ssh via sshpass -e (SSHPASS env, never argv). Used only when no key is supplied.
+	Timeout  time.Duration
 }
 
 // SSHClient runs remote commands on a WordPress host over SSH. Safe for
 // concurrent use; each call spawns its own ssh process. It satisfies Executor.
 type SSHClient struct {
-	addr    string
-	port    string
-	user    string
-	keyFile string
-	keyPEM  string
-	timeout time.Duration
+	addr     string
+	port     string
+	user     string
+	keyFile  string
+	keyPEM   string
+	password string
+	timeout  time.Duration
 }
 
 // User returns the SSH login user.
 func (c *SSHClient) User() string { return c.user }
+
+// usePassword reports whether this client authenticates by password (via sshpass)
+// rather than a key. A key ALWAYS wins: password is used only when a password is
+// set and no key material (file or PEM) is supplied.
+func (c *SSHClient) usePassword() bool {
+	return c.password != "" && c.keyFile == "" && strings.TrimSpace(c.keyPEM) == ""
+}
 
 // NewSSHClient builds an SSHClient. It does not contact the host until first use.
 func NewSSHClient(c SSHConfig) *SSHClient {
@@ -64,7 +76,7 @@ func NewSSHClient(c SSHConfig) *SSHClient {
 	if c.Port != 0 {
 		port = strconv.Itoa(c.Port)
 	}
-	return &SSHClient{addr: addr, port: port, user: user, keyFile: c.KeyFile, keyPEM: c.KeyPEM, timeout: c.Timeout}
+	return &SSHClient{addr: addr, port: port, user: user, keyFile: c.KeyFile, keyPEM: c.KeyPEM, password: c.Password, timeout: c.Timeout}
 }
 
 func splitHostPort(h string) (string, string) {
@@ -124,8 +136,9 @@ func (c *SSHClient) runOnce(remote string, stdin []byte) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
+	usePassword := c.usePassword()
+
 	args := []string{
-		"-o", "BatchMode=yes",
 		// Relay-forwarded lab boxes present varying host keys and the runner's
 		// known_hosts may be unwritable — discard host-key state so a key change
 		// never blocks the connection.
@@ -134,6 +147,17 @@ func (c *SSHClient) runOnce(remote string, stdin []byte) ([]byte, error) {
 		"-o", fmt.Sprintf("ConnectTimeout=%d", connectTimeoutSeconds(c.timeout)),
 		"-o", "ServerAliveInterval=15",
 		"-o", "ServerAliveCountMax=4",
+	}
+	if usePassword {
+		// BatchMode=yes disables password prompts, so it must be OFF for sshpass;
+		// force password auth so a stray agent/default key can't preempt it.
+		args = append(args,
+			"-o", "BatchMode=no",
+			"-o", "PreferredAuthentications=password",
+			"-o", "PubkeyAuthentication=no",
+		)
+	} else {
+		args = append(args, "-o", "BatchMode=yes")
 	}
 	if c.port != "" {
 		args = append(args, "-p", c.port)
@@ -152,7 +176,14 @@ func (c *SSHClient) runOnce(remote string, stdin []byte) ([]byte, error) {
 	}
 	args = append(args, target, remote)
 
-	cmd := exec.CommandContext(ctx, "ssh", args...)
+	var cmd *exec.Cmd
+	if usePassword {
+		// sshpass -e reads the password from $SSHPASS — never argv/process list.
+		cmd = exec.CommandContext(ctx, "sshpass", append([]string{"-e", "ssh"}, args...)...)
+		cmd.Env = append(os.Environ(), "SSHPASS="+c.password)
+	} else {
+		cmd = exec.CommandContext(ctx, "ssh", args...)
+	}
 	if stdin != nil {
 		cmd.Stdin = bytes.NewReader(stdin)
 	}

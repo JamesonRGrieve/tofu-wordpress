@@ -43,13 +43,14 @@ type providerClient struct {
 }
 
 type providerModel struct {
-	Host       types.String `tfsdk:"host"`
-	Port       types.Int64  `tfsdk:"port"`
-	User       types.String `tfsdk:"user"`
-	SSHKeyFile types.String `tfsdk:"ssh_key_file"`
-	SSHKeyPEM  types.String `tfsdk:"ssh_key_pem"`
-	Docroot    types.String `tfsdk:"docroot"`
-	Timeout    types.Int64  `tfsdk:"timeout"`
+	Host        types.String `tfsdk:"host"`
+	Port        types.Int64  `tfsdk:"port"`
+	User        types.String `tfsdk:"user"`
+	SSHKeyFile  types.String `tfsdk:"ssh_key_file"`
+	SSHKeyPEM   types.String `tfsdk:"ssh_key_pem"`
+	SSHPassword types.String `tfsdk:"ssh_password"`
+	Docroot     types.String `tfsdk:"docroot"`
+	Timeout     types.Int64  `tfsdk:"timeout"`
 }
 
 func (p *wordpressProvider) Metadata(_ context.Context, _ provider.MetadataRequest, resp *provider.MetadataResponse) {
@@ -86,7 +87,15 @@ func (p *wordpressProvider) Schema(_ context.Context, _ provider.SchemaRequest, 
 				Optional:  true,
 				Sensitive: true,
 				MarkdownDescription: "SSH private-key material (e.g. an OpenBao-signed key). Materialized to a temp " +
-					"0600 file per call; available at plan time, unlike a Terraform-written key file. Auth is key/cert only.",
+					"0600 file per call; available at plan time, unlike a Terraform-written key file. A key always " +
+					"wins over `ssh_password` when both are set.",
+			},
+			"ssh_password": schema.StringAttribute{
+				Optional:  true,
+				Sensitive: true,
+				MarkdownDescription: "SSH password (e.g. a per-guest root password from OpenBao) for the password-only " +
+					"CT fleet. Fed to ssh via `sshpass -e` (in `$SSHPASS`, never argv); requires `sshpass` on the runner. " +
+					"Used only when no key material (`ssh_key_file`/`ssh_key_pem`) is supplied.",
 			},
 			"docroot": schema.StringAttribute{
 				Optional: true,
@@ -113,12 +122,13 @@ func (p *wordpressProvider) Configure(ctx context.Context, req provider.Configur
 		timeout = time.Duration(cfg.Timeout.ValueInt64()) * time.Second
 	}
 	ssh := wordpress.NewSSHClient(wordpress.SSHConfig{
-		Host:    cfg.Host.ValueString(),
-		Port:    int(cfg.Port.ValueInt64()),
-		User:    cfg.User.ValueString(),
-		KeyFile: cfg.SSHKeyFile.ValueString(),
-		KeyPEM:  cfg.SSHKeyPEM.ValueString(),
-		Timeout: timeout,
+		Host:     cfg.Host.ValueString(),
+		Port:     int(cfg.Port.ValueInt64()),
+		User:     cfg.User.ValueString(),
+		KeyFile:  cfg.SSHKeyFile.ValueString(),
+		KeyPEM:   cfg.SSHKeyPEM.ValueString(),
+		Password: cfg.SSHPassword.ValueString(),
+		Timeout:  timeout,
 	})
 	docroot := defaultDocroot
 	if !cfg.Docroot.IsNull() && cfg.Docroot.ValueString() != "" {
